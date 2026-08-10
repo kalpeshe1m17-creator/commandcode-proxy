@@ -48,7 +48,38 @@ export async function chatRoutes(fastify: FastifyInstance) {
     const modelName = translated.params.model;
 
     try {
-      const upstreamStream = await sendToCC(translated, apiKey);
+      let upstreamStream: any;
+      try {
+        upstreamStream = await sendToCC(translated, apiKey);
+      } catch (err: any) {
+        logger.error(`[CHAT] Upstream fetch failed: ${err.message}`);
+
+        if (body.stream) {
+          reply.raw.setHeader('Content-Type', 'text/event-stream');
+          reply.raw.setHeader('Cache-Control', 'no-cache');
+          reply.raw.setHeader('Connection', 'keep-alive');
+
+          const state = adapter.createStreamEncoderState();
+          const errChunks = adapter.encodeOpenAIChunk(
+            { type: 'error', error: { message: err.message } },
+            state,
+            modelName
+          );
+          for (const c of errChunks) reply.raw.write(c);
+
+          const finishChunks = adapter.encodeOpenAIChunk({ type: 'finish', finishReason: 'stop' }, state, modelName);
+          for (const c of finishChunks) reply.raw.write(c);
+          return reply.raw.end();
+        } else {
+          return reply.status(502).send({
+            error: {
+              message: `Upstream connection error: ${err.message}`,
+              type: 'upstream_error',
+              code: 502,
+            },
+          });
+        }
+      }
 
       if (body.stream) {
         reply.raw.setHeader('Content-Type', 'text/event-stream');
@@ -92,8 +123,10 @@ export async function chatRoutes(fastify: FastifyInstance) {
           reply.raw.end();
         });
 
-        upstreamStream.on('error', (err) => {
+        upstreamStream.on('error', (err: any) => {
           logger.error(`[CHAT] Upstream stream error: ${err.message}`);
+          const errChunks = adapter.encodeOpenAIChunk({ type: 'error', error: { message: err.message } }, state, modelName);
+          for (const c of errChunks) reply.raw.write(c);
           reply.raw.end();
         });
 
@@ -116,21 +149,34 @@ export async function chatRoutes(fastify: FastifyInstance) {
 
           try {
             const event: CCEvent = JSON.parse(jsonStr);
-            if (event.type === 'text-delta' && event.text) fullText += event.text;
-            if (event.type === 'reasoning-delta' && event.text) reasoningContent += event.text;
+            if (event.type === 'error' && event.error) {
+              fullText += `\n[Upstream Error: ${event.error.message || JSON.stringify(event.error)}]\n`;
+            }
+            if (event.type === 'text-delta') {
+              const txt = event.text || event.data?.text;
+              if (txt) fullText += txt;
+            }
+            if (event.type === 'reasoning-delta') {
+              const txt = event.text || event.data?.text;
+              if (txt) reasoningContent += txt;
+            }
             if (event.type === 'tool-call-delta' || event.type === 'tool-call') {
-              const tcId = event.toolCallId || 'call_1';
+              const tcId = (event.data?.toolCallId as string) || (event.toolCallId as string) || 'call_1';
+              const name = (event.data?.toolName as string) || (event.toolName as string) || (event.data?.name as string) || (event.name as string) || 'tool';
+              const input = event.data?.input || event.input || event.data?.arguments || event.arguments;
               toolCallsMap.set(tcId, {
                 id: tcId,
                 type: 'function',
                 function: {
-                  name: event.toolName || event.name || 'tool',
-                  arguments: typeof event.arguments === 'string' ? event.arguments : JSON.stringify(event.input || {}),
+                  name,
+                  arguments: typeof input === 'string' ? input : JSON.stringify(input || {}),
                 },
               });
             }
-            if (event.type === 'finish') {
-              if (event.finishReason) finishReason = event.finishReason;
+            if (event.type === 'finish' || event.type === 'finish-step') {
+              if (event.finishReason || event.data?.finishReason) {
+                finishReason = event.finishReason || event.data?.finishReason;
+              }
             }
           } catch {}
         }
@@ -161,11 +207,11 @@ export async function chatRoutes(fastify: FastifyInstance) {
         });
       }
     } catch (err: any) {
-      logger.error(`[CHAT] Request failed: ${err.message}`);
+      logger.error(`[CHAT] Fatal request error: ${err.message}`);
       return reply.status(502).send({
         error: {
-          message: `Upstream processing error: ${err.message}`,
-          type: 'upstream_error',
+          message: `Internal proxy error: ${err.message}`,
+          type: 'internal_error',
           code: 502,
         },
       });

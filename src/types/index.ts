@@ -178,7 +178,7 @@ export interface CCRequestBody {
 }
 
 export interface CCEvent {
-  type: 'start' | 'text-delta' | 'reasoning-delta' | 'tool-call-delta' | 'tool-call' | 'finish' | 'error';
+  type: 'start' | 'text-delta' | 'reasoning-delta' | 'tool-call-delta' | 'tool-call' | 'finish' | 'finish-step' | 'error' | string;
   text?: string;
   toolCallId?: string;
   index?: number;
@@ -187,7 +187,7 @@ export interface CCEvent {
   input?: unknown;
   toolName?: string;
   finishReason?: string;
-  error?: { message: string };
+  error?: { message?: string; code?: string; type?: string; statusCode?: number };
   message?: string;
   data?: any;
 }

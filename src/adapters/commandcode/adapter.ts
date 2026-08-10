@@ -294,7 +294,9 @@ export class CommandCodeAdapter {
       return chunks;
     }
 
-    if (event.type === 'reasoning-delta' && event.text) {
+    if (event.type === 'error') {
+      const errObj = event.error || {};
+      const errMsg = errObj.message || errObj.code || JSON.stringify(errObj);
       chunks.push(
         `data: ${JSON.stringify({
           id: state.id,
@@ -304,7 +306,7 @@ export class CommandCodeAdapter {
           choices: [
             {
               index: 0,
-              delta: { reasoning_content: event.text },
+              delta: { content: `\n[Upstream Error: ${errMsg}]\n` },
               finish_reason: null,
             },
           ],
@@ -313,10 +315,33 @@ export class CommandCodeAdapter {
       return chunks;
     }
 
-    if (event.type === 'text-delta' && event.text) {
-      let rawText = event.text;
+    if (event.type === 'reasoning-delta') {
+      const text = event.text || event.data?.text;
+      if (text) {
+        chunks.push(
+          `data: ${JSON.stringify({
+            id: state.id,
+            object: 'chat.completion.chunk',
+            created: state.created,
+            model: modelName,
+            choices: [
+              {
+                index: 0,
+                delta: { reasoning_content: text },
+                finish_reason: null,
+              },
+            ],
+          })}\n\n`
+        );
+      }
+      return chunks;
+    }
 
-      // Extract real-time <think>...</think> tags
+    if (event.type === 'text-delta') {
+      let rawText = event.text || event.data?.text || '';
+      if (!rawText) return chunks;
+
+      // Extract real-time <think>...</think> tags if present in text
       if (rawText.includes('<think>') || state.thinkingState === 'in_think') {
         if (rawText.includes('<think>') && rawText.includes('</think>')) {
           const thinkMatch = rawText.match(/<think>([\s\S]*?)<\/think>/);
@@ -401,12 +426,16 @@ export class CommandCodeAdapter {
     }
 
     if (event.type === 'tool-call-delta' || event.type === 'tool-call') {
-      const toolCallId = event.toolCallId || `call_${crypto.randomUUID().slice(0, 8)}`;
+      const toolCallId = (event.data?.toolCallId as string) || (event.toolCallId as string) || `call_${crypto.randomUUID().slice(0, 8)}`;
       let idx = state.toolCallIdToIndex.get(toolCallId);
       if (idx === undefined) {
         idx = state.toolCallIndex++;
         state.toolCallIdToIndex.set(toolCallId, idx);
       }
+
+      const toolName = (event.data?.toolName as string) || (event.toolName as string) || (event.data?.name as string) || (event.name as string) || 'tool';
+      const input = event.data?.input || event.input || event.data?.arguments || event.arguments;
+      const argsStr = typeof input === 'string' ? input : input ? JSON.stringify(input) : '';
 
       chunks.push(
         `data: ${JSON.stringify({
@@ -424,8 +453,8 @@ export class CommandCodeAdapter {
                     id: toolCallId,
                     type: 'function',
                     function: {
-                      name: event.toolName || event.name || 'tool',
-                      arguments: typeof event.arguments === 'string' ? event.arguments : JSON.stringify(event.input || {}),
+                      name: toolName,
+                      arguments: argsStr,
                     },
                   },
                 ],
@@ -438,9 +467,9 @@ export class CommandCodeAdapter {
       return chunks;
     }
 
-    if (event.type === 'finish') {
+    if (event.type === 'finish' || event.type === 'finish-step') {
       state.sawFinish = true;
-      const finishReason = event.finishReason || (state.toolCallIdToIndex.size > 0 ? 'tool_calls' : 'stop');
+      const finishReason = event.finishReason || (event.data?.finishReason as string) || (state.toolCallIdToIndex.size > 0 ? 'tool_calls' : 'stop');
       chunks.push(
         `data: ${JSON.stringify({
           id: state.id,
