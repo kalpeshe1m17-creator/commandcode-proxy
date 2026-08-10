@@ -1,0 +1,28 @@
+{
+  "name": "commandcode-proxy-v3",
+  "version": "3.0.0",
+  "description": "Enterprise OpenAI & Anthropic Compatibility Proxy for Command Code AI with Reverse-Engineered CLI Wire Protocol, 7-Level Reasoning Engine & Auto-Quota Protection",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "build:exe": "esbuild src/index.ts --bundle --platform=node --target=node18 --format=cjs --outfile=dist/bundle.cjs",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "fastify": "^4.29.1",
+    "pino": "^9.14.0",
+    "pino-pretty": "^11.3.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.23.1",
+    "typescript": "^5.3.3",
+    "vitest": "^4.1.10"
+  }
+}
