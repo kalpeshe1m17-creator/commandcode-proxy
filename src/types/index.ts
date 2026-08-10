@@ -198,6 +198,7 @@ export interface StreamEncoderState {
   toolCallIndex: number;
   toolCallIdToIndex: Map<string, number>;
   sawFinish: boolean;
+  hasEmittedText: boolean;
   promptTokens: number;
   completionTokens: number;
   thinkingState: 'none' | 'in_think' | 'done';

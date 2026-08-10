@@ -10,7 +10,7 @@ import {
   CCEvent,
   StreamEncoderState,
 } from '../../types/index.js';
-import { resolveModelName } from '../../utils/models.js';
+import { resolveModelName, getCachedModels } from '../../utils/models.js';
 import { loadConfig } from '../../utils/config.js';
 
 export function toWirePermissionMode(mode?: string): 'auto-accept' | 'standard' | 'plan' {
@@ -54,6 +54,14 @@ export class CommandCodeAdapter {
   }
 
   private resolveReasoningEffort(model: string, requested?: any, thinkingConfig?: any): string | undefined {
+    const reasoningCapable: Record<string, string[]> = {
+      'deepseek/deepseek-v4-pro': ['low', 'medium', 'high', 'max'],
+      'deepseek/deepseek-v4-flash': ['low', 'medium', 'high', 'max'],
+      'zai-org/GLM-5.2': ['low', 'medium', 'high', 'max'],
+      'xai/grok-4.5': ['low', 'medium', 'high'],
+      'poolside/laguna-s-2.1-free': ['low', 'medium', 'high', 'max'],
+    };
+
     if (thinkingConfig && thinkingConfig.type === 'enabled') {
       const budget = thinkingConfig.budget_tokens ?? 2048;
       if (budget >= 16000) return 'max';
@@ -64,25 +72,49 @@ export class CommandCodeAdapter {
 
     if (requested == null) return undefined;
 
-    const levelMap: Record<string | number, string> = {
-      0: 'none',
-      1: 'minimal',
-      2: 'low',
-      3: 'medium',
-      4: 'high',
-      5: 'xhigh',
-      6: 'max',
-      7: 'max',
-      none: 'none',
-      minimal: 'minimal',
-      low: 'low',
-      medium: 'medium',
-      high: 'high',
-      xhigh: 'xhigh',
-      max: 'max',
-    };
+    let supported = reasoningCapable[model];
+    if (!supported) {
+      const modelLower = model.toLowerCase();
+      if (
+        modelLower.includes('deepseek') ||
+        modelLower.includes('glm-') ||
+        modelLower.includes('grok') ||
+        modelLower.includes('reasoner') ||
+        modelLower.includes('thinking') ||
+        modelLower.includes('o1') ||
+        modelLower.includes('o3') ||
+        modelLower.includes('qwq') ||
+        modelLower.includes('laguna') ||
+        modelLower.includes('inkling') ||
+        modelLower.includes('step') ||
+        modelLower.includes('kimi') ||
+        modelLower.includes('qwen') ||
+        modelLower.includes('claude-sonnet') ||
+        modelLower.includes('claude-opus')
+      ) {
+        supported = ['low', 'medium', 'high', 'max'];
+      }
+    }
 
-    return levelMap[requested] || String(requested);
+    if (!supported) return undefined;
+
+    let effortStr = String(requested).toLowerCase();
+    if (typeof requested === 'number') {
+      if (requested >= 5) effortStr = 'max';
+      else if (requested === 4) effortStr = 'high';
+      else if (requested === 3) effortStr = 'medium';
+      else effortStr = 'low';
+    }
+
+    if (supported.includes(effortStr)) return effortStr;
+
+    const rankMap: Record<string, number> = { none: 0, minimal: 0, low: 1, medium: 2, high: 3, xhigh: 3, max: 4 };
+    const reqRank = rankMap[effortStr] ?? 2;
+    const atOrBelow = supported.filter(e => (rankMap[e] ?? 2) <= reqRank);
+    if (atOrBelow.length > 0) {
+      return atOrBelow.reduce((best, e) => ((rankMap[e] ?? 2) > (rankMap[best] ?? 2) ? e : best));
+    }
+    return supported[0] || 'medium';
   }
 
   private pruneDanglingTools(messages: CCMessage[]): CCMessage[] {
@@ -266,6 +298,7 @@ export class CommandCodeAdapter {
       toolCallIndex: 0,
       toolCallIdToIndex: new Map<string, number>(),
       sawFinish: false,
+      hasEmittedText: false,
       promptTokens: 0,
       completionTokens: 0,
       thinkingState: 'none',
@@ -296,28 +329,32 @@ export class CommandCodeAdapter {
 
     if (event.type === 'error') {
       const errObj = event.error || {};
-      const errMsg = errObj.message || errObj.code || JSON.stringify(errObj);
-      chunks.push(
-        `data: ${JSON.stringify({
-          id: state.id,
-          object: 'chat.completion.chunk',
-          created: state.created,
-          model: modelName,
-          choices: [
-            {
-              index: 0,
-              delta: { content: `\n[Upstream Error: ${errMsg}]\n` },
-              finish_reason: null,
-            },
-          ],
-        })}\n\n`
-      );
+      const errMsg = errObj.message || errObj.code || (typeof errObj === 'string' ? errObj : '');
+      if (errMsg && errMsg !== 'unknown') {
+        state.hasEmittedText = true;
+        chunks.push(
+          `data: ${JSON.stringify({
+            id: state.id,
+            object: 'chat.completion.chunk',
+            created: state.created,
+            model: modelName,
+            choices: [
+              {
+                index: 0,
+                delta: { content: `\n[Upstream Error: ${errMsg}]\n` },
+                finish_reason: null,
+              },
+            ],
+          })}\n\n`
+        );
+      }
       return chunks;
     }
 
     if (event.type === 'reasoning-delta') {
       const text = event.text || event.data?.text;
       if (text) {
+        state.hasEmittedText = true;
         chunks.push(
           `data: ${JSON.stringify({
             id: state.id,
@@ -349,6 +386,7 @@ export class CommandCodeAdapter {
             const reasoningPart = thinkMatch[1];
             const cleanText = rawText.replace(/<think>[\s\S]*?<\/think>/, '');
             if (reasoningPart) {
+              state.hasEmittedText = true;
               chunks.push(
                 `data: ${JSON.stringify({
                   id: state.id,
@@ -365,6 +403,7 @@ export class CommandCodeAdapter {
           state.thinkingState = 'in_think';
           const thinkContent = rawText.split('<think>')[1] || '';
           if (thinkContent) {
+            state.hasEmittedText = true;
             chunks.push(
               `data: ${JSON.stringify({
                 id: state.id,
@@ -380,6 +419,7 @@ export class CommandCodeAdapter {
           state.thinkingState = 'done';
           const parts = rawText.split('</think>');
           if (parts[0]) {
+            state.hasEmittedText = true;
             chunks.push(
               `data: ${JSON.stringify({
                 id: state.id,
@@ -392,6 +432,7 @@ export class CommandCodeAdapter {
           }
           rawText = parts[1] || '';
         } else if (state.thinkingState === 'in_think') {
+          state.hasEmittedText = true;
           chunks.push(
             `data: ${JSON.stringify({
               id: state.id,
@@ -406,6 +447,7 @@ export class CommandCodeAdapter {
       }
 
       if (rawText) {
+        state.hasEmittedText = true;
         chunks.push(
           `data: ${JSON.stringify({
             id: state.id,
@@ -426,6 +468,7 @@ export class CommandCodeAdapter {
     }
 
     if (event.type === 'tool-call-delta' || event.type === 'tool-call') {
+      state.hasEmittedText = true;
       const toolCallId = (event.data?.toolCallId as string) || (event.toolCallId as string) || `call_${crypto.randomUUID().slice(0, 8)}`;
       let idx = state.toolCallIdToIndex.get(toolCallId);
       if (idx === undefined) {

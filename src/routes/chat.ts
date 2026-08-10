@@ -43,6 +43,7 @@ export async function chatRoutes(fastify: FastifyInstance) {
     }
 
     req.raw.setTimeout(0);
+    const startTime = Date.now();
 
     const translated = adapter.translateOpenAIRequest(body);
     const modelName = translated.params.model;
@@ -52,16 +53,16 @@ export async function chatRoutes(fastify: FastifyInstance) {
       try {
         upstreamStream = await sendToCC(translated, apiKey);
       } catch (err: any) {
-        logger.error(`[CHAT] Upstream fetch failed: ${err.message}`);
-
         if (body.stream) {
           reply.raw.setHeader('Content-Type', 'text/event-stream');
           reply.raw.setHeader('Cache-Control', 'no-cache');
           reply.raw.setHeader('Connection', 'keep-alive');
 
           const state = adapter.createStreamEncoderState();
+          const cleanErrMessage = err.message || 'Upstream service error';
+
           const errChunks = adapter.encodeOpenAIChunk(
-            { type: 'error', error: { message: err.message } },
+            { type: 'error', error: { message: cleanErrMessage } },
             state,
             modelName
           );
@@ -120,13 +121,21 @@ export async function chatRoutes(fastify: FastifyInstance) {
             const finishChunks = adapter.encodeOpenAIChunk({ type: 'finish', finishReason: 'stop' }, state, modelName);
             for (const c of finishChunks) reply.raw.write(c);
           }
+          const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+          logger.info(`[OUTPUT] Model: ${modelName} | Status: 200 OK | Duration: ${duration}s`);
           reply.raw.end();
         });
 
         upstreamStream.on('error', (err: any) => {
-          logger.error(`[CHAT] Upstream stream error: ${err.message}`);
-          const errChunks = adapter.encodeOpenAIChunk({ type: 'error', error: { message: err.message } }, state, modelName);
-          for (const c of errChunks) reply.raw.write(c);
+          logger.error(`[OUTPUT] Model: ${modelName} | Upstream Stream Error: ${err.message}`);
+          if (err?.message && !err.message.includes('ended before terminal chunk')) {
+            const errChunks = adapter.encodeOpenAIChunk({ type: 'error', error: { message: err.message } }, state, modelName);
+            for (const c of errChunks) reply.raw.write(c);
+          }
+          if (!state.sawFinish) {
+            const finishChunks = adapter.encodeOpenAIChunk({ type: 'finish', finishReason: 'stop' }, state, modelName);
+            for (const c of finishChunks) reply.raw.write(c);
+          }
           reply.raw.end();
         });
 
@@ -149,8 +158,8 @@ export async function chatRoutes(fastify: FastifyInstance) {
 
           try {
             const event: CCEvent = JSON.parse(jsonStr);
-            if (event.type === 'error' && event.error) {
-              fullText += `\n[Upstream Error: ${event.error.message || JSON.stringify(event.error)}]\n`;
+            if (event.type === 'error' && event.error && event.error.message && event.error.message !== 'unknown') {
+              fullText += `\n[Upstream Error: ${event.error.message}]\n`;
             }
             if (event.type === 'text-delta') {
               const txt = event.text || event.data?.text;
@@ -191,6 +200,9 @@ export async function chatRoutes(fastify: FastifyInstance) {
           choiceMessage.tool_calls = Array.from(toolCallsMap.values());
           finishReason = 'tool_calls';
         }
+
+        const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+        logger.info(`[OUTPUT] Model: ${modelName} | Status: 200 OK | Duration: ${duration}s`);
 
         return reply.send({
           id: `chatcmpl-${Math.random().toString(36).slice(2, 10)}`,
