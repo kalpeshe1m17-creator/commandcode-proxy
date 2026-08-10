@@ -1,5 +1,38 @@
+# Dependencies
 node_modules/
+
+# Build output
 dist/
 build/
+
+# Environment & Secrets
 .env
+.env.*
+*.key
+*.pem
+*.p12
+*.secret
+
+# Sensitive runtime data
+config.json
+models.json
+auth.json
+*.auth.json
+.commandcode/
+
+# Logs
 *.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
+
+# Temp launcher
+Launcher.cs

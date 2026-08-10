@@ -1,6 +1,6 @@
 import { FastifyInstance } from 'fastify';
 import { CommandCodeAdapter } from '../adapters/commandcode/adapter.js';
-import { sendToCC } from '../adapters/commandcode/upstream.js';
+import { sendToCC, isAbortError } from '../adapters/commandcode/upstream.js';
 import { OpenAIChatRequest, CCEvent } from '../types/index.js';
 import { getActiveApiKey, getGatewayRunning } from '../utils/config.js';
 import { logger } from '../utils/logger.js';
@@ -42,8 +42,23 @@ export async function chatRoutes(fastify: FastifyInstance) {
       });
     }
 
+    // Harden TCP socket for long multi-minute reasoning sessions
     req.raw.setTimeout(0);
+    if (req.raw.socket) {
+      req.raw.socket.setTimeout(0);
+      req.raw.socket.setKeepAlive(true, 10000);
+      req.raw.socket.setNoDelay(true);
+    }
+
     const startTime = Date.now();
+    const abortController = new AbortController();
+
+    // Cancel upstream ONLY if client prematurely disconnects before response is finished (v2 pattern)
+    req.raw.on('close', () => {
+      if (!reply.raw.writableEnded && req.raw.destroyed && !req.raw.complete) {
+        abortController.abort();
+      }
+    });
 
     const translated = adapter.translateOpenAIRequest(body);
     const modelName = translated.params.model;
@@ -51,33 +66,30 @@ export async function chatRoutes(fastify: FastifyInstance) {
     try {
       let upstreamStream: any;
       try {
-        upstreamStream = await sendToCC(translated, apiKey);
+        upstreamStream = await sendToCC(translated, apiKey, abortController.signal);
       } catch (err: any) {
+        // Silently drop client-cancelled requests
+        if (isAbortError(err) || (err as any)?.isAbort) {
+          return reply.raw.end();
+        }
         if (body.stream) {
           reply.raw.setHeader('Content-Type', 'text/event-stream');
           reply.raw.setHeader('Cache-Control', 'no-cache');
           reply.raw.setHeader('Connection', 'keep-alive');
 
           const state = adapter.createStreamEncoderState();
-          const cleanErrMessage = err.message || 'Upstream service error';
-
           const errChunks = adapter.encodeOpenAIChunk(
-            { type: 'error', error: { message: cleanErrMessage } },
+            { type: 'error', error: { message: err.message || 'Upstream service error' } },
             state,
             modelName
           );
           for (const c of errChunks) reply.raw.write(c);
-
           const finishChunks = adapter.encodeOpenAIChunk({ type: 'finish', finishReason: 'stop' }, state, modelName);
           for (const c of finishChunks) reply.raw.write(c);
           return reply.raw.end();
         } else {
           return reply.status(502).send({
-            error: {
-              message: `Upstream connection error: ${err.message}`,
-              type: 'upstream_error',
-              code: 502,
-            },
+            error: { message: `Upstream connection error: ${err.message}`, type: 'upstream_error', code: 502 },
           });
         }
       }
@@ -86,10 +98,22 @@ export async function chatRoutes(fastify: FastifyInstance) {
         reply.raw.setHeader('Content-Type', 'text/event-stream');
         reply.raw.setHeader('Cache-Control', 'no-cache');
         reply.raw.setHeader('Connection', 'keep-alive');
+        reply.raw.setHeader('X-Accel-Buffering', 'no');
 
         const state = adapter.createStreamEncoderState();
         const initialChunks = adapter.encodeOpenAIChunk({ type: 'start' }, state, modelName);
         for (const c of initialChunks) reply.raw.write(c);
+
+        // SSE Keep-Alive Ping every 15s to prevent Cloudflare/Proxy timeout drops
+        const pingInterval = setInterval(() => {
+          if (!reply.raw.writableEnded) {
+            reply.raw.write(':\n\n');
+          }
+        }, 15000);
+
+        const cleanupPings = () => {
+          clearInterval(pingInterval);
+        };
 
         const rl = createInterface({ input: upstreamStream, crlfDelay: Infinity });
 
@@ -117,6 +141,7 @@ export async function chatRoutes(fastify: FastifyInstance) {
         });
 
         rl.on('close', () => {
+          cleanupPings();
           if (!state.sawFinish) {
             const finishChunks = adapter.encodeOpenAIChunk({ type: 'finish', finishReason: 'stop' }, state, modelName);
             for (const c of finishChunks) reply.raw.write(c);
@@ -127,11 +152,14 @@ export async function chatRoutes(fastify: FastifyInstance) {
         });
 
         upstreamStream.on('error', (err: any) => {
-          logger.error(`[OUTPUT] Model: ${modelName} | Upstream Stream Error: ${err.message}`);
-          if (err?.message && !err.message.includes('ended before terminal chunk')) {
-            const errChunks = adapter.encodeOpenAIChunk({ type: 'error', error: { message: err.message } }, state, modelName);
-            for (const c of errChunks) reply.raw.write(c);
+          // Silently swallow AbortErrors — these are normal client cancellations
+          if (isAbortError(err) || (err as any)?.isAbort) {
+            cleanupPings();
+            reply.raw.end();
+            return;
           }
+          cleanupPings();
+          logger.error(`[OUTPUT] Model: ${modelName} | Upstream Stream Error: ${err.message}`);
           if (!state.sawFinish) {
             const finishChunks = adapter.encodeOpenAIChunk({ type: 'finish', finishReason: 'stop' }, state, modelName);
             for (const c of finishChunks) reply.raw.write(c);
@@ -219,13 +247,12 @@ export async function chatRoutes(fastify: FastifyInstance) {
         });
       }
     } catch (err: any) {
+      if (isAbortError(err) || (err as any)?.isAbort) {
+        return reply.raw.end();
+      }
       logger.error(`[CHAT] Fatal request error: ${err.message}`);
       return reply.status(502).send({
-        error: {
-          message: `Internal proxy error: ${err.message}`,
-          type: 'internal_error',
-          code: 502,
-        },
+        error: { message: `Internal proxy error: ${err.message}`, type: 'internal_error', code: 502 },
       });
     }
   });

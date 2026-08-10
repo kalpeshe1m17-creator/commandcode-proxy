@@ -10,33 +10,60 @@ import {
   CCEvent,
   StreamEncoderState,
 } from '../../types/index.js';
-import { resolveModelName, getCachedModels } from '../../utils/models.js';
-import { loadConfig } from '../../utils/config.js';
+import { resolveModelName } from '../../utils/models.js';
 
 export function toWirePermissionMode(mode?: string): 'auto-accept' | 'standard' | 'plan' {
-  if (mode === 'bypass' || mode === 'auto-accept') return 'auto-accept';
-  if (mode === 'plan') return 'plan';
-  return 'standard';
+  return 'auto-accept';
 }
+
+const Qn = ['low', 'medium', 'high', 'xhigh', 'max'];
+const Xn = ['low', 'medium', 'high', 'xhigh'];
+const Zn = ['low', 'medium', 'high'];
+const er = ['high', 'max'];
+
+const OFFICIAL_REASONING_MAP: Record<string, string[]> = {
+  'claude-sonnet-5': Qn,
+  'claude-sonnet-4-6': Qn,
+  'claude-fable-5': Qn,
+  'claude-opus-5': Qn,
+  'claude-opus-4-8': Qn,
+  'claude-opus-4-7': Qn,
+  'gpt-5.6-sol': Qn,
+  'gpt-5.6-terra': Qn,
+  'gpt-5.6-luna': Qn,
+  'gpt-5.5': Xn,
+  'gpt-5.4': Xn,
+  'gpt-5.3-codex': Xn,
+  'gpt-5.4-mini': Zn,
+  'deepseek/deepseek-v4-pro': er,
+  'deepseek/deepseek-v4-flash': er,
+  'zai-org/GLM-5.2': er,
+  'google/gemini-3.6-flash': Zn,
+  'google/gemini-3.5-flash': Zn,
+  'google/gemini-3.5-flash-lite': Zn,
+  'google/gemini-3.1-flash-lite': Zn,
+  'sakana/fugu-ultra': ['high', 'xhigh'],
+  'xai/grok-4.5': Zn,
+  'Qwen/Qwen3.8-Max': ['low', 'medium', 'xhigh'],
+};
 
 export class CommandCodeAdapter {
   private static convertTools(tools?: OpenAIChatRequest['tools']): CCTool[] | undefined {
     if (!tools || tools.length === 0) return undefined;
     const sliced = tools.slice(0, 15);
+    // toWireTools per CLI source: only name, description, input_schema — NO strict field
     return sliced.map(t => {
       if (t.type === 'custom' && t.custom) {
         return {
           name: t.custom.name,
           description: t.custom.description || '',
           input_schema: t.custom.parameters || { type: 'object', properties: {} },
-          strict: false,
         };
       }
       return {
         name: t.function!.name,
         description: t.function!.description || '',
         input_schema: t.function!.parameters || { type: 'object', properties: {} },
-        strict: t.function!.strict ?? false,
       };
     });
   }
@@ -54,14 +81,6 @@ export class CommandCodeAdapter {
   }
 
   private resolveReasoningEffort(model: string, requested?: any, thinkingConfig?: any): string | undefined {
-    const reasoningCapable: Record<string, string[]> = {
-      'deepseek/deepseek-v4-pro': ['low', 'medium', 'high', 'max'],
-      'deepseek/deepseek-v4-flash': ['low', 'medium', 'high', 'max'],
-      'zai-org/GLM-5.2': ['low', 'medium', 'high', 'max'],
-      'xai/grok-4.5': ['low', 'medium', 'high'],
-      'poolside/laguna-s-2.1-free': ['low', 'medium', 'high', 'max'],
-    };
-
     if (thinkingConfig && thinkingConfig.type === 'enabled') {
       const budget = thinkingConfig.budget_tokens ?? 2048;
       if (budget >= 16000) return 'max';
@@ -70,9 +89,7 @@ export class CommandCodeAdapter {
       return 'low';
     }
 
-    if (requested == null) return undefined;
-
-    let supported = reasoningCapable[model];
+    let supported = OFFICIAL_REASONING_MAP[model];
     if (!supported) {
       const modelLower = model.toLowerCase();
       if (
@@ -90,25 +107,42 @@ export class CommandCodeAdapter {
         modelLower.includes('kimi') ||
         modelLower.includes('qwen') ||
         modelLower.includes('claude-sonnet') ||
-        modelLower.includes('claude-opus')
+        modelLower.includes('claude-opus') ||
+        modelLower.includes('gpt-5')
       ) {
-        supported = ['low', 'medium', 'high', 'max'];
+        supported = ['low', 'medium', 'high', 'xhigh', 'max'];
       }
     }
 
     if (!supported) return undefined;
 
+    if (requested == null) {
+      return supported.includes('medium') ? 'medium' : supported[0];
+    }
+
     let effortStr = String(requested).toLowerCase();
     if (typeof requested === 'number') {
-      if (requested >= 5) effortStr = 'max';
+      if (requested >= 6) effortStr = 'ultra';
+      else if (requested === 5) effortStr = 'max';
       else if (requested === 4) effortStr = 'high';
       else if (requested === 3) effortStr = 'medium';
-      else effortStr = 'low';
+      else if (requested === 2) effortStr = 'low';
+      else effortStr = 'minimal';
     }
 
     if (supported.includes(effortStr)) return effortStr;
 
-    const rankMap: Record<string, number> = { none: 0, minimal: 0, low: 1, medium: 2, high: 3, xhigh: 3, max: 4 };
+    const rankMap: Record<string, number> = {
+      none: 0,
+      minimal: 0,
+      low: 1,
+      medium: 2,
+      high: 3,
+      xhigh: 4,
+      max: 5,
+      ultra: 5,
+    };
+
     const reqRank = rankMap[effortStr] ?? 2;
     const atOrBelow = supported.filter(e => (rankMap[e] ?? 2) <= reqRank);
     if (atOrBelow.length > 0) {
@@ -223,8 +257,6 @@ export class CommandCodeAdapter {
     const finalMessages = this.pruneDanglingTools(ccMessages);
     const targetModel = resolveModelName(req.model);
     const convertedTools = CommandCodeAdapter.convertTools(req.tools);
-    const config = loadConfig();
-    const modeSetting = toWirePermissionMode(config.permissionMode);
 
     const requestBody: CCRequestBody = {
       config: {
@@ -244,7 +276,7 @@ export class CommandCodeAdapter {
       memory: null,
       taste: null,
       skills: null,
-      permissionMode: modeSetting,
+      permissionMode: 'auto-accept',
       threadId: crypto.randomUUID(),
       params: {
         model: targetModel,
@@ -253,7 +285,7 @@ export class CommandCodeAdapter {
         ...(convertedTools && convertedTools.length > 0 ? { tools: convertedTools } : {}),
         ...(req.tool_choice ? { tool_choice: CommandCodeAdapter.convertToolChoice(req.tool_choice) } : {}),
         stream: true,
-        max_tokens: req.max_completion_tokens ?? req.max_tokens ?? 64000,
+        max_tokens: req.max_completion_tokens ?? req.max_tokens ?? 64000, // JS=64e3 per CLI source
         ...(req.temperature != null ? { temperature: req.temperature } : {}),
         ...(req.top_p != null ? { top_p: req.top_p } : {}),
         reasoning_effort: this.resolveReasoningEffort(targetModel, req.reasoning_effort, req.thinking),
@@ -467,17 +499,18 @@ export class CommandCodeAdapter {
       return chunks;
     }
 
-    if (event.type === 'tool-call-delta' || event.type === 'tool-call') {
+    if (event.type === 'tool-call') {
+      // CLI source: h.toolCallId, h.toolName, h.input ?? h.args (no h.data wrapper)
       state.hasEmittedText = true;
-      const toolCallId = (event.data?.toolCallId as string) || (event.toolCallId as string) || `call_${crypto.randomUUID().slice(0, 8)}`;
+      const toolCallId = (event.toolCallId as string) || `call_${crypto.randomUUID().slice(0, 8)}`;
       let idx = state.toolCallIdToIndex.get(toolCallId);
       if (idx === undefined) {
         idx = state.toolCallIndex++;
         state.toolCallIdToIndex.set(toolCallId, idx);
       }
 
-      const toolName = (event.data?.toolName as string) || (event.toolName as string) || (event.data?.name as string) || (event.name as string) || 'tool';
-      const input = event.data?.input || event.input || event.data?.arguments || event.arguments;
+      const toolName = (event.toolName as string) || (event.name as string) || 'tool';
+      const input = event.input ?? event.arguments;
       const argsStr = typeof input === 'string' ? input : input ? JSON.stringify(input) : '';
 
       chunks.push(
@@ -510,9 +543,14 @@ export class CommandCodeAdapter {
       return chunks;
     }
 
-    if (event.type === 'finish' || event.type === 'finish-step') {
+    if (event.type === 'finish') {
+      // CLI source: finish event has rawFinishReason and finishReason
+      // finishReason values: 'tool-calls' -> map to 'tool_calls', 'length' -> 'length', else 'stop'
       state.sawFinish = true;
-      const finishReason = event.finishReason || (event.data?.finishReason as string) || (state.toolCallIdToIndex.size > 0 ? 'tool_calls' : 'stop');
+      const rawFR = event.finishReason || (state.toolCallIdToIndex.size > 0 ? 'tool-calls' : 'stop');
+      const finishReason = rawFR === 'tool-calls' || rawFR === 'tool_calls' ? 'tool_calls'
+        : rawFR === 'length' || rawFR === 'max_tokens' ? 'length'
+        : 'stop';
       chunks.push(
         `data: ${JSON.stringify({
           id: state.id,

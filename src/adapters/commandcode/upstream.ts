@@ -9,6 +9,16 @@ function formatPayloadSize(bytes: number): string {
   return `${(bytes / 1048576).toFixed(2)} MB`;
 }
 
+export function isAbortError(err: any): boolean {
+  return (
+    err?.name === 'AbortError' ||
+    err?.code === 'ABORT_ERR' ||
+    err?.message === 'This operation was aborted' ||
+    err?.message?.toLowerCase().includes('aborted') ||
+    err?.message?.toLowerCase().includes('abort')
+  );
+}
+
 export function buildHeaders(apiKey: string, ccVersion: string, body: CCRequestBody): Record<string, string> {
   const sessionId = body.threadId;
   const baseDir = (String(body.config?.workingDir || process.cwd())).split(/[/\\]/).filter(Boolean).pop() ?? 'commandcode-proxy';
@@ -30,7 +40,7 @@ export function buildHeaders(apiKey: string, ccVersion: string, body: CCRequestB
 export async function sendToCC(body: CCRequestBody, apiKey: string, abortSignal?: AbortSignal): Promise<Readable> {
   const config = loadConfig();
   const url = `${config.ccApiBase}/alpha/generate`;
-  
+
   // Force auto-accept hardcoded so no model ever requests permission
   body.permissionMode = 'auto-accept';
   body.params.stream = true;
@@ -40,12 +50,21 @@ export async function sendToCC(body: CCRequestBody, apiKey: string, abortSignal?
 
   logger.info(`[INPUT] Model: ${body.params.model} | Payload: ${formatPayloadSize(reqData.length)}`);
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers,
-    body: reqData,
-    signal: abortSignal,
-  });
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: reqData,
+      signal: abortSignal,
+    });
+  } catch (err: any) {
+    if (isAbortError(err)) {
+      logger.info(`[INPUT] Model: ${body.params.model} | Request cancelled by client`);
+      throw Object.assign(new Error('__ABORT__'), { isAbort: true });
+    }
+    throw err;
+  }
 
   if (!response.ok) {
     const errorText = await response.text();
