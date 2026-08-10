@@ -376,22 +376,38 @@ export async function fetchLiveUsageStats(apiKey: string, ccApiBase: string, ccV
     'x-command-code-version': ccVersion,
   };
 
-  const results: any = { whoami: null, credits: null, summary: null };
+  const results: any = { whoami: null, credits: null, subscription: null, summary: null };
 
   try {
-    const resWho = await fetch(`${ccApiBase}/whoami`, { headers });
+    const resWho = await fetch(`${ccApiBase}/alpha/whoami`, { headers });
     if (resWho.ok) results.whoami = await resWho.json();
-  } catch {}
+  } catch (err: any) {
+    logger.warn(`[USAGE] /alpha/whoami fetch error: ${err.message}`);
+  }
+
+  const orgId = results.whoami?.org?.id || results.whoami?.data?.org?.id;
+  const orgQuery = orgId ? `?orgId=${encodeURIComponent(orgId)}` : '';
 
   try {
-    const resCred = await fetch(`${ccApiBase}/credits`, { headers });
+    const resCred = await fetch(`${ccApiBase}/alpha/billing/credits${orgQuery}`, { headers });
     if (resCred.ok) results.credits = await resCred.json();
-  } catch {}
+  } catch (err: any) {
+    logger.warn(`[USAGE] /alpha/billing/credits fetch error: ${err.message}`);
+  }
 
   try {
-    const resSum = await fetch(`${ccApiBase}/usage/summary`, { headers });
+    const resSub = await fetch(`${ccApiBase}/alpha/billing/subscriptions${orgQuery}`, { headers });
+    if (resSub.ok) results.subscription = await resSub.json();
+  } catch (err: any) {
+    logger.warn(`[USAGE] /alpha/billing/subscriptions fetch error: ${err.message}`);
+  }
+
+  try {
+    const resSum = await fetch(`${ccApiBase}/alpha/usage/summary${orgQuery}`, { headers });
     if (resSum.ok) results.summary = await resSum.json();
-  } catch {}
+  } catch (err: any) {
+    logger.warn(`[USAGE] /alpha/usage/summary fetch error: ${err.message}`);
+  }
 
   return results;
 }
